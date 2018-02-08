@@ -36,4 +36,18 @@ public class SampleController {
         object.put("state",sampleService.lock());
         return object;
     }
+
+    @RequestMapping("/unlock")
+    public JSONObject unLock(){
+        JSONObject object = new JSONObject();
+        object.put("state",sampleService.releaseLock());
+        return object;
+    }
+
+    @RequestMapping("/semaphore")
+    public JSONObject semaphore(){
+        JSONObject object = new JSONObject();
+        object.put("state",sampleService.getSemaphore());
+        return object;
+    }
 }

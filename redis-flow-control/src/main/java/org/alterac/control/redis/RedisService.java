@@ -1,11 +1,15 @@
 package org.alterac.control.redis;
 
+import org.alterac.control.exception.RequestOverflowException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.dao.DataAccessException;
 import org.springframework.data.redis.connection.RedisConnection;
+import org.springframework.data.redis.connection.RedisZSetCommands;
 import org.springframework.data.redis.core.*;
+import org.springframework.data.redis.serializer.RedisSerializer;
+import org.springframework.data.redis.serializer.StringRedisSerializer;
 import org.springframework.stereotype.Component;
 
 import javax.annotation.Resource;
@@ -20,7 +24,7 @@ public class RedisService {
 
     private String headerOwner = "semaphore:owner:";
 
-    private String counter = "count:semaphore:";
+    private String counter = "semaphore:counter:";
 
     private String counterLock = "lock:count:";
 
@@ -65,58 +69,121 @@ public class RedisService {
         return null;
     }
 
-    @SuppressWarnings("unchecked")
+
     public boolean releaseCounterLock(String name,String lock){
-        SessionCallback<List<Object>> sessionCallback = new SessionCallback<List<Object>>() {
-            @Override
-            public List<Object> execute(RedisOperations operations) throws DataAccessException {
-                String counterLockName = counterLock+name;
-                //operations.watch(counterLockName);
-                /*Set<String> keys = operations.keys("*");
-                for(String key:keys){
-                    logger.info("key:"+key);
-                }*/
-                Object val = operations.boundValueOps(counterLockName).get();
-                logger.info("name:"+counterLockName+" lock:"+ val);
-                operations.multi();
-                /*if(Arrays.equals(operations.boundValueOps(counterLockName).get(),lock.getBytes())){
-                    connection.multi();
-                    connection.del(counterLockBytes);
-                    return connection.exec();
-                }*/
-                //operations.unwatch();
-                return operations.exec();
+        if(lock==null)return false;
+        String counterLockName = counterLock+name;
+        String val;
+        SessionCallback<List<Object>> sessionCallback = new ReleaseLockCallback(counterLockName);
+        while(true){
+            Object m=null;
+            val = stringRedisTemplate.boundValueOps(counterLockName).get();
+            if(lock.equals(val)){
+                m = stringRedisTemplate.executePipelined(sessionCallback);
+            }else {
+                return false;
             }
-        };
-        /*RedisCallback<List<Object>> callback = new RedisCallback<List<Object>>() {
-            @Override
-            public List<Object> doInRedis(RedisConnection connection) throws DataAccessException {
-                byte[] counterLockBytes = (counterLock+name).getBytes();
-                connection.openPipeline();
-                connection.watch(counterLockBytes);
-                byte[] val = connection.get(counterLockBytes);
-                logger.info("lock:"+new String(val));
-                if(Arrays.equals(counterLockBytes,lock.getBytes())){
-                    connection.multi();
-                    connection.del(counterLockBytes);
-                    return connection.exec();
-                }
-                connection.unwatch();
-                return new ArrayList<>();
-            }
-        };*/
-        List m = stringRedisTemplate.executePipelined(sessionCallback);
-        for(Object k:m){
-            logger.info("item:"+k);
+            if(m!=null)return true;
         }
-        return m!=null&&m.size()>0;
     }
 
-    public String getSemaphore(String name,long time){
-        String key = UUID.randomUUID().toString();
-        String semaphoreName = header + name;
-        long now = System.currentTimeMillis();
-
+    public String getSemaphore(String name,Long time,Long limit){
+        String lock = getCountLock(name);
+        if(lock!=null&&!lock.equals("")){
+            String semaphore = stringRedisTemplate.execute(new AcquireSemaphoreCallback(name,5L));
+            if(semaphore!=null)return semaphore;
+            else throw new RequestOverflowException("Request to "+name+" over limit!");
+        }
         return null;
+    }
+
+    public boolean releaseSemaphore(String name,String lock){
+        return stringRedisTemplate.execute(new ReleaseSemaphoreCallback(name,lock));
+    }
+
+    private class ReleaseLockCallback implements SessionCallback{
+
+        private String lockName;
+
+        public ReleaseLockCallback(String lockName){
+            this.lockName=lockName;
+        }
+
+        @Override
+        public Object execute(RedisOperations redisOperations) throws DataAccessException {
+            redisOperations.watch(lockName);
+            redisOperations.multi();
+            redisOperations.delete(lockName);
+            return redisOperations.exec();
+        }
+    }
+
+    private class AcquireSemaphoreCallback implements RedisCallback<String>{
+
+        private String name;
+
+        private Long limit;
+
+        public AcquireSemaphoreCallback(String name,Long limit){
+            this.name=name;
+            this.limit=limit;
+        }
+
+        @Override
+        public String doInRedis(RedisConnection connection) throws DataAccessException {
+            String key = UUID.randomUUID().toString();
+            String semaphoreName = header + name;
+            String ownerName = headerOwner + name;
+            String counterName = counter + name;
+            long now = System.currentTimeMillis();
+            connection.openPipeline();
+            RedisSerializer<String> serializer = stringRedisTemplate.getStringSerializer();
+            connection.zRemRangeByScore(serializer.serialize(semaphoreName),Double.MIN_VALUE,now-getSemaphoreTimeout*1000);
+            connection.zInterStore(serializer.serialize(ownerName), RedisZSetCommands.Aggregate.SUM,new int[]{1,0},serializer.serialize(ownerName),serializer.serialize(semaphoreName));
+
+            connection.incr(serializer.serialize(counterName));
+            Long cnt = (Long)connection.closePipeline().get(2);
+
+            connection.openPipeline();
+
+            connection.zAdd(serializer.serialize(semaphoreName),now,serializer.serialize(key));
+            connection.zAdd(serializer.serialize(ownerName),cnt,serializer.serialize(key));
+
+            connection.zRank(serializer.serialize(ownerName),serializer.serialize(key));
+
+            if(limit > (Long)connection.closePipeline().get(2)){
+                return key;
+            }
+
+            connection.openPipeline();
+
+            connection.zRem(serializer.serialize(semaphoreName),serializer.serialize(key));
+            connection.zRem(serializer.serialize(ownerName),serializer.serialize(key));
+            connection.closePipeline();
+            return null;
+        }
+    }
+
+    private class ReleaseSemaphoreCallback implements RedisCallback<Boolean>{
+
+        private String name;
+
+        private String lock;
+
+        public ReleaseSemaphoreCallback(String name,String lock){
+            this.name=name;
+            this.lock=lock;
+        }
+
+        @Override
+        public Boolean doInRedis(RedisConnection connection) throws DataAccessException {
+            connection.openPipeline();
+            String headerName = header+name;
+            String ownerName = headerOwner+name;
+            RedisSerializer<String> serializer = stringRedisTemplate.getStringSerializer();
+            connection.zRem(serializer.serialize(headerName),serializer.serialize(lock));
+            connection.zRem(serializer.serialize(ownerName),serializer.serialize(lock));
+            return ((Long)connection.closePipeline().get(0))==1;
+        }
     }
 }
